@@ -1,12 +1,14 @@
-cmake_minimum_required(VERSION 3.22)
-project(MyProject)
-
-include(FetchContent)
-FetchContent_Declare(
-  Kokkos
-  URL https://github.com/kokkos/kokkos/archive/refs/tags/5.0.0.zip
-)
-FetchContent_MakeAvailable(Kokkos)
-
-add_executable(HelloKokkos HelloKokkos.cpp)
-target_link_libraries(HelloKokkos Kokkos::kokkos)
+cmake_minimum_required(VERSION 3.16)
+project(serial_lbm_3d_ogive LANGUAGES CXX)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+add_executable(lbm_3d src/lbm_3d.cpp)
+target_compile_features(lbm_3d PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(lbm_3d PRIVATE /W4 /O2)
+else()
+  target_compile_options(lbm_3d PRIVATE -O3 -Wall -Wextra -Wpedantic)
+endif()
+enable_testing()
+add_test(NAME lbm_3d_smoke COMMAND lbm_3d --nx 28 --ny 28 --nz 64 --steps 20 --every 20 --out smoke_output)
