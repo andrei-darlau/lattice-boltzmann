@@ -13,7 +13,7 @@ ctest --test-dir build --output-on-failure
 ./build/lbm_3d --steps 500 --every 250 --out output_3d
 ```
 
-No dependencies beyond a C++17 toolchain and CMake. Serial execution only: no CUDA, MPI, OpenMP, GPU, or Kokkos.
+The solver requires only a C++17 toolchain and CMake. Serial execution only: no CUDA, MPI, OpenMP, GPU, or Kokkos. The optional reader regression test requires Python 3 with the VTK Python modules. CMake enables it when those modules are importable by the Python interpreter it finds; set `-DPython3_EXECUTABLE=/path/to/python` when configuring to select an interpreter. CMake reports when the reader test is disabled. Run `ctest --test-dir build -R vti_reader --output-on-failure` to run it separately.
 
 ## Model and flow axes
 
@@ -55,14 +55,21 @@ For better boundary resolution, increase all three lattice extents while preserv
 
 The model uses D3Q19 BGK collision and pull streaming, no-slip halfway bounce-back at solid links, first-order non-equilibrium extrapolation for Z inlet/outlet, and periodic transverse X/Y boundaries. Viscosity in lattice units is `nu = U*D/Re` and `tau = 0.5+3*nu`.
 
-## Visualize the *simulation* (not a standalone surface mesh)
+## Visualize the simulation in ParaView
 
-Open `output_3d/flow_000500.vtk` in ParaView. `solid` is a voxelized obstacle field. Use **Contour** at `solid=0.5` to visualize it, and use **Slice** or **Stream Tracer** and color by `speed` or `vorticity_magnitude` to analyze the surrounding flow. Volume arrays: `velocity`, `speed`, `density`, `vorticity_magnitude`, and `solid`.
+The solver writes `flow_000000.vti` at initialization and subsequent numbered `.vti` snapshots at the requested interval and final step. Open the `.vti` file series in ParaView and click **Apply**; the animation controls select snapshots. The six-digit numbers are simulation step indices, not physical times. Use a fresh output directory for each run to avoid mixing old snapshots with new ones.
 
-## Verified
+The XML ImageData volume has unit spacing and origin `(0,0,0)` in lattice units, with dimensions `nx × ny × nz`. All arrays are **point data**, sampled at integer lattice coordinates, with X varying fastest. `velocity` is a three-component vector; `speed`, `density`, `vorticity_magnitude`, and `solid` are scalars. `solid` is 1 inside the body and 0 in the fluid. Flow is in +Z, so the wake is downstream toward larger Z.
 
-- Compiles successfully with C++17 and passes CTest smoke test at `28 x 28 x 64` for 20 steps.
-- Default `48 x 48 x 112` run completed 500 steps. Last snapshot: density 0.99483–1.00376, maximum speed 0.05036 lattice units.
-- Checked the stored `solid` field: 2952 solid voxels across Z planes 19–60. The occupied cross-sectional area grows through the ogive, stays constant in the cylindrical portion, and then decreases through the boattail.
+1. Select the volume, add **Contour**, choose the point array `solid`, and set the isovalue to `0.5`. Apply and show the resulting surface. It interpolates between lattice samples and approximates the voxelized boundary.
+2. Select the original volume and add **Slice** through the center of the body, with a normal along X or Y. Color it by `speed`, `density`, or `vorticity_magnitude`; rescale the color range if necessary.
+3. Select the original volume and add **Stream Tracer**. Choose `velocity` as the vectors and place a seed line or plane upstream of the nose, across X/Y at a small Z. Color the resulting lines by `speed`. Adjust the seed and integration settings to inspect the wake.
+4. For a vortex view, color a slice by `vorticity_magnitude` or apply a contour to that array and choose an isovalue based on its displayed range. Use the animation controls to see how the wake evolves.
+
+Solid points have zero velocity, speed, and vorticity, and density is set to 1 as a placeholder; they are not fluid measurements. The curl uses periodic X/Y differences and one-sided differences at the Z ends. Its finite differences use zero velocity at solid neighbors, so near-wall values reflect the voxelized boundary. Streamlines and contours near the surface are interpolated from these point samples.
+
+## Verification
+
+`ctest` runs a small solver smoke test. When VTK Python modules are available it also runs `lbm_3d_vti_reader`, which generates fresh initial and final snapshots and uses VTK's XML reader to check dimensions, coordinates, arrays, values, and a nonempty obstacle contour. The original legacy files were readable by VTK in the checked sample; no specific corruption was established. XML ImageData makes the array types, association, byte order, and binary block lengths explicit.
 
 **Limitations:** This is an educational low-Reynolds-number solver. It is not validated for actual turbulent airflow, drag prediction, weapons aerodynamics, or flight performance. The voxelized surface has staircasing, the boundary conditions are approximate, and periodic crossflow boundaries may interact with the wake. No fins, moving parts, deployment geometry, or weapon-specific features are implemented.

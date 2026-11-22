@@ -272,14 +272,17 @@ class Solver {
               << minrho << ", " << maxrho << "] | max |u|=" << maxu << '\n';
   }
 
-  static void big_endian_float(std::ostream& out, float x) {
-    static_assert(sizeof(float)==4,"Expect 32-bit IEEE float");
-    std::uint32_t bits=0;
-    std::memcpy(&bits,&x,sizeof(bits));
-    const std::array<char,4> bytes={
-      static_cast<char>((bits>>24)&0xff), static_cast<char>((bits>>16)&0xff),
-      static_cast<char>((bits>>8)&0xff), static_cast<char>(bits&0xff)};
-    out.write(bytes.data(),4);
+  // VTK XML appended data uses explicitly little-endian byte counts and values.
+  static void little_endian(std::ostream& out, std::uint64_t value, int bytes) {
+    for (int i=0; i<bytes; ++i)
+      out.put(static_cast<char>((value >> (8*i)) & 0xff));
+  }
+  static void write_float(std::ostream& out, float value) {
+    static_assert(sizeof(float)==4 && std::numeric_limits<float>::is_iec559,
+                  "VTK Float32 requires IEEE 754 float");
+    std::uint32_t bits;
+    std::memcpy(&bits,&value,sizeof(bits));
+    little_endian(out,bits,4);
   }
 
   void write_vtk(int t) const {
@@ -310,33 +313,47 @@ class Solver {
     }
 
     std::ostringstream name;
-    name << "flow_" << std::setw(6) << std::setfill('0') << t << ".vtk";
+    name << "flow_" << std::setw(6) << std::setfill('0') << t << ".vti";
     const auto filename=(std::filesystem::path(cfg_.out)/name.str());
     std::ofstream out(filename, std::ios::binary);
     if (!out) throw std::runtime_error("Cannot write " + filename.string());
-    out << "# vtk DataFile Version 3.0\n"
-           "Ogive body: serial D3Q19 lattice Boltzmann\n"
-           "BINARY\nDATASET STRUCTURED_POINTS\n"
-        << "DIMENSIONS " << nx << ' ' << ny << ' ' << nz << "\n"
-           "ORIGIN 0 0 0\nSPACING 1 1 1\n"
-           "POINT_DATA " << n_ << "\n"
-           "VECTORS velocity float\n";
+
+    // Offsets count bytes from the first byte after the appended-data underscore.
+    // Each raw block starts with a UInt64 byte count, followed by its payload.
+    const std::uint64_t count=static_cast<std::uint64_t>(n_);
+    const std::uint64_t vector_bytes=count*3*4, scalar_bytes=count*4;
+    const std::uint64_t speed_offset=8+vector_bytes;
+    const std::uint64_t density_offset=speed_offset+8+scalar_bytes;
+    const std::uint64_t curl_offset=density_offset+8+scalar_bytes;
+    const std::uint64_t solid_offset=curl_offset+8+scalar_bytes;
+    out << "<?xml version=\"1.0\"?>\n"
+           "<VTKFile type=\"ImageData\" version=\"1.0\" byte_order=\"LittleEndian\" header_type=\"UInt64\">\n"
+           "  <ImageData WholeExtent=\"0 " << nx-1 << " 0 " << ny-1 << " 0 " << nz-1
+        << "\" Origin=\"0 0 0\" Spacing=\"1 1 1\">\n"
+           "    <Piece Extent=\"0 " << nx-1 << " 0 " << ny-1 << " 0 " << nz-1 << "\">\n"
+           "      <PointData Scalars=\"speed\" Vectors=\"velocity\">\n"
+           "        <DataArray type=\"Float32\" Name=\"velocity\" NumberOfComponents=\"3\" format=\"appended\" offset=\"0\"/>\n"
+           "        <DataArray type=\"Float32\" Name=\"speed\" format=\"appended\" offset=\"" << speed_offset << "\"/>\n"
+           "        <DataArray type=\"Float32\" Name=\"density\" format=\"appended\" offset=\"" << density_offset << "\"/>\n"
+           "        <DataArray type=\"Float32\" Name=\"vorticity_magnitude\" format=\"appended\" offset=\"" << curl_offset << "\"/>\n"
+           "        <DataArray type=\"UInt8\" Name=\"solid\" format=\"appended\" offset=\"" << solid_offset << "\"/>\n"
+           "      </PointData>\n      <CellData/>\n    </Piece>\n  </ImageData>\n"
+           "  <AppendedData encoding=\"raw\">_";
+    little_endian(out,vector_bytes,8);
     for(std::size_t i=0;i<n_;++i) {
-      big_endian_float(out,ux[i]);
-      big_endian_float(out,uy[i]);
-      big_endian_float(out,uz[i]);
+      write_float(out,ux[i]); write_float(out,uy[i]); write_float(out,uz[i]);
     }
-    out << "\nSCALARS speed float 1\nLOOKUP_TABLE default\n";
+    little_endian(out,scalar_bytes,8);
     for(std::size_t i=0;i<n_;++i)
-      big_endian_float(out,std::sqrt(ux[i]*ux[i]+uy[i]*uy[i]+uz[i]*uz[i]));
-    out << "\nSCALARS density float 1\nLOOKUP_TABLE default\n";
-    for (float v:rho) big_endian_float(out,v);
-    out << "\nSCALARS vorticity_magnitude float 1\nLOOKUP_TABLE default\n";
-    for (float v:wmag) big_endian_float(out,v);
-    out << "\nSCALARS solid unsigned_char 1\nLOOKUP_TABLE default\n";
+      write_float(out,std::sqrt(ux[i]*ux[i]+uy[i]*uy[i]+uz[i]*uz[i]));
+    little_endian(out,scalar_bytes,8);
+    for (float v:rho) write_float(out,v);
+    little_endian(out,scalar_bytes,8);
+    for (float v:wmag) write_float(out,v);
+    little_endian(out,count,8);
     out.write(reinterpret_cast<const char*>(solid_.data()),
               static_cast<std::streamsize>(solid_.size()));
-    out << '\n';
+    out << "</AppendedData>\n</VTKFile>\n";
     if(!out) throw std::runtime_error("Error writing " + filename.string());
     std::cout << "wrote " << filename.string() << '\n';
   }
