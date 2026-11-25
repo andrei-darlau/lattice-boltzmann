@@ -3,7 +3,6 @@
 // All quantities are in non-dimensional lattice units.
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -20,17 +19,17 @@
 #include <utility>
 #include <vector>
 
+#if !defined(LBM_DISABLE_SIMD) && (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#include <immintrin.h>
+#define LBM_AVX_COLLISION 1
+#endif
+
 namespace {
 constexpr int Q = 19;
-constexpr std::array<int, Q> cx = {0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0};
-constexpr std::array<int, Q> cy = {0, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 0, 0, 1,-1, 1,-1};
-constexpr std::array<int, Q> cz = {0, 0, 0, 0, 0, 1,-1, 0, 0, 0, 0, 1,-1,-1, 1, 1,-1,-1, 1};
-constexpr std::array<int, Q> opposite = {0, 2,1, 4,3, 6,5, 8,7, 10,9, 12,11, 14,13, 16,15, 18,17};
-constexpr std::array<double, Q> weight = {
-    1.0/3.0,
-    1.0/18.0,1.0/18.0,1.0/18.0,1.0/18.0,1.0/18.0,1.0/18.0,
-    1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0,
-    1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0};
+constexpr int cx[Q] = {0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0};
+constexpr int cy[Q] = {0, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 0, 0, 1,-1, 1,-1};
+constexpr int cz[Q] = {0, 0, 0, 0, 0, 1,-1, 0, 0, 0, 0, 1,-1,-1, 1, 1,-1,-1, 1};
+constexpr int opposite[Q] = {0, 2,1, 4,3, 6,5, 8,7, 10,9, 12,11, 14,13, 16,15, 18,17};
 
 struct Config {
   int nx = 288, ny = 288, nz = 672;
@@ -93,20 +92,87 @@ Config parse_args(int argc, char** argv) {
 inline std::size_t idx(int x,int y,int z,int nx,int ny) {
   return (static_cast<std::size_t>(z)*ny + y)*nx + x;
 }
-inline double feq(int q, double rho, double ux, double uy, double uz) {
-  const double cu = cx[q]*ux + cy[q]*uy + cz[q]*uz;
-  const double uu = ux*ux + uy*uy + uz*uz;
-  return weight[q]*rho*(1.0 + 3.0*cu + 4.5*cu*cu - 1.5*uu);
+// After the rest population, consecutive D3Q19 directions are opposites.
+void equilibria(const Macros& m, double (&eq)[Q]) {
+  const double speed_term=1.5*(m.ux*m.ux + m.uy*m.uy + m.uz*m.uz);
+  const double axial_weight=(1.0/18.0)*m.rho;
+  const double diagonal_weight=(1.0/36.0)*m.rho;
+  const double projection[Q/2]={m.ux, m.uy, m.uz, m.ux+m.uy, m.ux-m.uy,
+                                m.ux+m.uz, m.ux-m.uz, m.uy+m.uz, m.uy-m.uz};
+  eq[0]=(1.0/3.0)*m.rho*(1.0-speed_term);
+  for (int pair=0;pair<Q/2;++pair) {
+    const int q=2*pair+1;
+    const double cu=projection[pair], linear=3.0*cu, quadratic=4.5*cu*cu;
+    const double w=pair<3 ? axial_weight : diagonal_weight;
+    eq[q]  =w*(1.0+linear+quadratic-speed_term);
+    eq[q+1]=w*(1.0-linear+quadratic-speed_term);
+  }
 }
 inline Macros macros(const double* f) {
-  double rho=0, mx=0, my=0, mz=0;
-  for (int q=0;q<Q;++q) {
-    rho+=f[q]; mx+=cx[q]*f[q]; my+=cy[q]*f[q]; mz+=cz[q]*f[q];
-  }
+  // Unroll the moments, retaining direction order in each sum.
+  const double rho=f[0]+f[1]+f[2]+f[3]+f[4]+f[5]+f[6]+f[7]+f[8]+f[9]
+                  +f[10]+f[11]+f[12]+f[13]+f[14]+f[15]+f[16]+f[17]+f[18];
+  const double mx=f[1]-f[2]+f[7]-f[8]+f[9]-f[10]+f[11]-f[12]+f[13]-f[14];
+  const double my=f[3]-f[4]+f[7]-f[8]-f[9]+f[10]+f[15]-f[16]+f[17]-f[18];
+  const double mz=f[5]-f[6]+f[11]-f[12]-f[13]+f[14]+f[15]-f[16]-f[17]+f[18];
   if (!std::isfinite(rho) || !(rho>0.0))
     throw std::runtime_error("Nonpositive/nonfinite density: run is unstable");
   return {rho,mx/rho,my/rho,mz/rho};
 }
+
+#ifdef LBM_AVX_COLLISION
+// Each packed value holds one D3Q19 direction from four adjacent X cells.
+__attribute__((target("avx")))
+void collide_four(double* cells, std::size_t pitch, double bgk_omega, double tau, double smagorinsky) {
+  __m256d f[Q];
+  for (int q=0;q<Q;++q) f[q]=_mm256_loadu_pd(cells+q*pitch);
+
+  const __m256d rho=f[0]+f[1]+f[2]+f[3]+f[4]+f[5]+f[6]+f[7]+f[8]+f[9]
+                   +f[10]+f[11]+f[12]+f[13]+f[14]+f[15]+f[16]+f[17]+f[18];
+  const __m256d positive=_mm256_cmp_pd(rho,_mm256_setzero_pd(),_CMP_GT_OQ);
+  const __m256d finite=_mm256_cmp_pd(rho,_mm256_set1_pd(std::numeric_limits<double>::max()),_CMP_LE_OQ);
+  if (_mm256_movemask_pd(_mm256_and_pd(positive,finite)) != 15)
+    throw std::runtime_error("Nonpositive/nonfinite density: run is unstable");
+  const __m256d ux=(f[1]-f[2]+f[7]-f[8]+f[9]-f[10]+f[11]-f[12]+f[13]-f[14])/rho;
+  const __m256d uy=(f[3]-f[4]+f[7]-f[8]-f[9]+f[10]+f[15]-f[16]+f[17]-f[18])/rho;
+  const __m256d uz=(f[5]-f[6]+f[11]-f[12]-f[13]+f[14]+f[15]-f[16]-f[17]+f[18])/rho;
+  const __m256d speed_term=1.5*(ux*ux+uy*uy+uz*uz);
+  const __m256d axial=(1.0/18.0)*rho, diagonal=(1.0/36.0)*rho;
+  const __m256d projection[]={ux,uy,uz,ux+uy,ux-uy,ux+uz,ux-uz,uy+uz,uy-uz};
+  __m256d eq[Q];
+  eq[0]=(1.0/3.0)*rho*(1.0-speed_term);
+  for (int pair=0;pair<Q/2;++pair) {
+    const __m256d cu=projection[pair], linear=3.0*cu, quadratic=4.5*cu*cu;
+    const __m256d w=pair<3 ? axial : diagonal;
+    eq[2*pair+1]=w*(1.0+linear+quadratic-speed_term);
+    eq[2*pair+2]=w*(1.0-linear+quadratic-speed_term);
+  }
+  __m256d omega=_mm256_set1_pd(bgk_omega);
+  if (smagorinsky>0) {
+    __m256d pxx{},pyy{},pzz{},pxy{},pxz{},pyz{};
+    for (int q=0;q<Q;++q) {
+      const __m256d neq=f[q]-eq[q];
+      pxx+=double(cx[q]*cx[q])*neq; pyy+=double(cy[q]*cy[q])*neq;
+      pzz+=double(cz[q]*cz[q])*neq; pxy+=double(cx[q]*cy[q])*neq;
+      pxz+=double(cx[q]*cz[q])*neq; pyz+=double(cy[q]*cz[q])*neq;
+    }
+    const __m256d norm=_mm256_sqrt_pd(pxx*pxx+pyy*pyy+pzz*pzz+2.0*(pxy*pxy+pxz*pxz+pyz*pyz));
+    const double scale=36.0/std::sqrt(2.0)*(smagorinsky*smagorinsky);
+    omega=1.0/(0.5*(tau+_mm256_sqrt_pd(tau*tau+scale*norm/rho)));
+  }
+  for (int q=0;q<Q;++q)
+    _mm256_storeu_pd(cells+q*pitch,f[q]-omega*(f[q]-eq[q]));
+}
+#endif
+// A row stores all nx values for one direction consecutively. Scalar
+// boundaries and diagnostics gather a single cell from those 19 spans.
+void load_cell(const double* first, std::size_t pitch, double (&cell)[Q]) {
+  for (int q=0;q<Q;++q) cell[q]=first[q*pitch];
+}
+void store_cell(double* first, std::size_t pitch, const double (&cell)[Q]) {
+  for (int q=0;q<Q;++q) first[q*pitch]=cell[q];
+}
+
 // The ogive profile is defined in lattice units, not physical dimensions.
 // s = distance from the front tip; 0 <= s <= nose_length.
 // The formula gives R(0)=0 and R(L)=radius, with zero slope at R(L).
@@ -163,7 +229,8 @@ class Solver {
  public:
   explicit Solver(Config c) : cfg_(std::move(c)),
       n_(static_cast<std::size_t>(cfg_.nx)*cfg_.ny*cfg_.nz),
-      solid_(n_,0), f_(n_*Q,0), plane_size_(static_cast<std::size_t>(cfg_.nx)*cfg_.ny),
+      solid_(n_,0), plane_size_(static_cast<std::size_t>(cfg_.nx)*cfg_.ny),
+      planes_(cfg_.nz),
       pending_(plane_size_*Q), current_(plane_size_*Q) {
     radius_=std::min(cfg_.nx,cfg_.ny)/8.5;
     const double diameter=2.0*radius_;
@@ -204,8 +271,12 @@ class Solver {
     const RearPlates plates{profile_.radius_at(mount_z)-overlap*radial,
                             mount_z-overlap*axial, 1.875*radius_+overlap,
                             radius_, std::max(0.75,0.10*radius_), axial, radial};
+    double initial[Q];
+    equilibria({1.0,0.0,0.0,cfg_.u_in},initial);
     std::size_t solid_count=0;
     for(int z=0;z<cfg_.nz;++z) {
+      auto& plane=planes_[z];
+      plane.resize(plane_size_*Q);
       const double r=profile_.radius_at(static_cast<double>(z));
       for(int y=0;y<cfg_.ny;++y) for(int x=0;x<cfg_.nx;++x) {
         const auto i=idx(x,y,z,cfg_.nx,cfg_.ny);
@@ -214,8 +285,7 @@ class Solver {
                   plates.inside(dx,dy,z) ||
                   (cfg_.canopy && canopy_.inside(x,y,z));
         solid_count+=solid_[i];
-        for (int q=0;q<Q;++q)
-          f_[i*Q+q]=feq(q,1.0,0.0,0.0,cfg_.u_in);
+        store_cell(plane.data()+static_cast<std::size_t>(y)*cfg_.nx*Q+x,cfg_.nx,initial);
       }
     }
     if (!solid_count) throw std::runtime_error("No solid cells in geometry");
@@ -232,6 +302,9 @@ class Solver {
               << ", U=" << cfg_.u_in << ", Re=" << cfg_.reynolds
               << ", nu=" << viscosity_ << ", tau=" << tau_
               << ", Cs=" << cfg_.smagorinsky << "\n";
+#ifdef LBM_AVX_COLLISION
+    std::cout << "Collision kernel: " << (use_avx_ ? "AVX (4 doubles)" : "scalar") << '\n';
+#endif
     write_vtk(0);
     for (int t=1;t<=cfg_.steps;++t) {
       stream();
@@ -252,14 +325,17 @@ class Solver {
   Config cfg_;
   std::size_t n_;
   std::vector<std::uint8_t> solid_;
-  std::vector<double> f_;
   const std::size_t plane_size_;
+  std::vector<std::vector<double>> planes_;
   std::vector<double> pending_, current_;
   double radius_=0, viscosity_=0, tau_=0;
   RevolvedProfile profile_{};
   Canopy canopy_{};
   double fx_=0, fy_=0, fz_=0, cd_sum_=0;
   int cd_count_=0;
+#ifdef LBM_AVX_COLLISION
+  const bool use_avx_=__builtin_cpu_supports("avx");
+#endif
 
   double cd() const {
     const double pi=std::acos(-1.0);
@@ -267,38 +343,56 @@ class Solver {
   }
 
   void collide_plane(int z) {
-    const auto end=(z+1)*plane_size_;
-    for (std::size_t i=z*plane_size_;i<end;++i) {
-      if (solid_[i]) continue;
-      double* fi=&f_[i*Q];
-      const Macros m=macros(fi);
-      double local_tau=tau_;
-      if (cfg_.smagorinsky>0) {
-        // Estimate the non-equilibrium momentum-flux norm. Experimental
-        // Smagorinsky closure; not a verified turbulence model.
-        double pxx=0,pyy=0,pzz=0,pxy=0,pxz=0,pyz=0;
-        for (int q=0;q<Q;++q) {
-          const double neq=fi[q]-feq(q,m.rho,m.ux,m.uy,m.uz);
-          pxx+=cx[q]*cx[q]*neq; pyy+=cy[q]*cy[q]*neq;
-          pzz+=cz[q]*cz[q]*neq; pxy+=cx[q]*cy[q]*neq;
-          pxz+=cx[q]*cz[q]*neq; pyz+=cy[q]*cz[q]*neq;
+    const auto* solid=solid_.data()+z*plane_size_;
+    double* plane=planes_[z].data();
+    const double bgk_omega=1.0/tau_;
+    const int nx=cfg_.nx;
+    for (int y=0;y<cfg_.ny;++y) {
+      const auto row=static_cast<std::size_t>(y)*nx;
+      double* values=plane+row*Q;
+      const auto* mask=solid+row;
+      for (int x=0;x<nx;++x) {
+        if (mask[x]) continue;
+#ifdef LBM_AVX_COLLISION
+        if (use_avx_ && nx-x>=4 && !mask[x+1] && !mask[x+2] && !mask[x+3]) {
+          collide_four(values+x,nx,bgk_omega,tau_,cfg_.smagorinsky);
+          x+=3;
+          continue;
         }
-        const double norm=std::sqrt(pxx*pxx+pyy*pyy+pzz*pzz+
-                                    2*(pxy*pxy+pxz*pxz+pyz*pyz));
-        const double cs2=cfg_.smagorinsky*cfg_.smagorinsky;
-        local_tau=0.5*(tau_+std::sqrt(tau_*tau_+
-                      36.0/std::sqrt(2.0)*cs2*norm/m.rho));
-      }
-      const double omega=1.0/local_tau;
-      for (int q=0;q<Q;++q) {
-        const double eq=feq(q,m.rho,m.ux,m.uy,m.uz);
-        fi[q]=fi[q]-omega*(fi[q]-eq);
+#endif
+        double fi[Q];
+        load_cell(values+x,nx,fi);
+        const Macros m=macros(fi);
+        double eq[Q];
+        equilibria(m,eq);
+        double omega=bgk_omega;
+        if (cfg_.smagorinsky>0) {
+          // Estimate the non-equilibrium momentum-flux norm. Experimental
+          // Smagorinsky closure; not a verified turbulence model.
+          double pxx=0,pyy=0,pzz=0,pxy=0,pxz=0,pyz=0;
+          for (int q=0;q<Q;++q) {
+            const double neq=fi[q]-eq[q];
+            pxx+=cx[q]*cx[q]*neq; pyy+=cy[q]*cy[q]*neq;
+            pzz+=cz[q]*cz[q]*neq; pxy+=cx[q]*cy[q]*neq;
+            pxz+=cx[q]*cz[q]*neq; pyz+=cy[q]*cz[q]*neq;
+          }
+          const double norm=std::sqrt(pxx*pxx+pyy*pyy+pzz*pzz+
+                                      2*(pxy*pxy+pxz*pxz+pyz*pyz));
+          const double cs2=cfg_.smagorinsky*cfg_.smagorinsky;
+          const double local_tau=0.5*(tau_+std::sqrt(tau_*tau_+
+                        36.0/std::sqrt(2.0)*cs2*norm/m.rho));
+          omega=1.0/local_tau;
+        }
+        for (int q=0;q<Q;++q)
+          fi[q]-=omega*(fi[q]-eq[q]);
+        store_cell(values+x,nx,fi);
       }
     }
   }
   void stream() {
     const int nx=cfg_.nx,ny=cfg_.ny,nz=cfg_.nz;
     fx_=fy_=fz_=0;
+    std::vector<std::uint32_t> reflected_links(nx,0);
     // Interior +Z flow planes; the Z inlet/outlet are set below.
     // X/Y transverse boundaries are periodic.
     // D3Q19 reaches just one plane away. Keep z-1 pending until z has
@@ -307,61 +401,116 @@ class Solver {
     collide_plane(1);
     for (int z=1;z<nz-1;++z) {
       collide_plane(z+1);
-      for(int y=0;y<ny;++y) for (int x=0;x<nx;++x) {
-        const auto dest=idx(x,y,z,nx,ny);
-        if (solid_[dest]) continue;
-        double* dst=&current_[(static_cast<std::size_t>(y)*nx+x)*Q];
+      for (int y=0;y<ny;++y) {
+        const int source_y[3]={y+1==ny ? 0 : y+1, y, y==0 ? ny-1 : y-1};
+        const auto row=static_cast<std::size_t>(y)*nx;
+        const auto* dest_mask=solid_.data()+z*plane_size_+row;
+        double* streamed=current_.data()+row*Q;
+        bool has_reflections=false;
+        // Stream each direction along contiguous X cells in both buffers.
         for (int q=0;q<Q;++q) {
-          const int sx=(x-cx[q]+nx)%nx;
-          const int sy=(y-cy[q]+ny)%ny;
           const int sz=z-cz[q];
-          const auto src=idx(sx,sy,sz,nx,ny);
-          if (solid_[src]) {
-            const int oq=opposite[q];
-            const double reflected=f_[dest*Q+oq];
-            dst[q]=reflected;
-            // The incident population travels toward the solid in direction oq.
-            fx_+=2*reflected*cx[oq];
-            fy_+=2*reflected*cy[oq];
-            fz_+=2*reflected*cz[oq];
-          } else dst[q]=f_[src*Q+q];
+          const auto src_row=static_cast<std::size_t>(source_y[cy[q]+1])*nx;
+          const auto* src_mask=solid_.data()+sz*plane_size_+src_row;
+          const auto direction=static_cast<std::size_t>(q)*nx;
+          const double* src=planes_[sz].data()+src_row*Q+direction;
+          const double* incident=planes_[z].data()+row*Q+static_cast<std::size_t>(opposite[q])*nx;
+          double* dst=streamed+direction;
+          // A periodic shift splits the row into at most two contiguous copies.
+          auto pull_span = [&](int x0, int sx0, int count) {
+            std::memcpy(dst+x0,src+sx0,static_cast<std::size_t>(count)*sizeof(double));
+            const auto* begin=src_mask+sx0;
+            const auto* end=begin+count;
+            const auto* next=begin;
+            while (next<end) {
+              next=static_cast<const std::uint8_t*>(std::memchr(next,1,end-next));
+              if (!next) break;
+              const int x=x0+static_cast<int>(next-begin);
+              if (!dest_mask[x]) {
+                dst[x]=incident[x];
+                reflected_links[x] |= std::uint32_t{1}<<q;
+                has_reflections=true;
+              }
+              ++next;
+            }
+          };
+          const int sx0=cx[q]>0 ? nx-1 : -cx[q];
+          pull_span(0,sx0,nx-sx0);
+          if (sx0) pull_span(nx-sx0,0,sx0);
+        }
+        // Forces are floating-point sums. Retain the original cell/direction
+        // order even though populations are now streamed direction first.
+        if (has_reflections) {
+          for (int x=0;x<nx;++x) {
+            const auto links=reflected_links[x];
+            if (!links) continue;
+            for (int q=1;q<Q;++q) {
+              if (!(links & (std::uint32_t{1}<<q))) continue;
+              const double momentum=2*streamed[static_cast<std::size_t>(q)*nx+x];
+              const int oq=opposite[q];
+              fx_+=momentum*cx[oq];
+              fy_+=momentum*cy[oq];
+              fz_+=momentum*cz[oq];
+            }
+            reflected_links[x]=0;
+          }
         }
       }
-      if (z>1) std::copy(pending_.begin(),pending_.end(),f_.begin()+(z-1)*plane_size_*Q);
+      if (z>1) planes_[z-1].swap(pending_);
       pending_.swap(current_);
     }
-    std::copy(pending_.begin(),pending_.end(),f_.begin()+(nz-2)*plane_size_*Q);
+    planes_[nz-2].swap(pending_);
   }
   void set_open_boundaries() {
     // First-order non-equilibrium extrapolation at Z inlet/outlet.
     // This is a simplified educational boundary condition.
-    const int nx=cfg_.nx,ny=cfg_.ny,nz=cfg_.nz;
-    for(int y=0;y<ny;++y) for(int x=0;x<nx;++x) {
-      const auto in=idx(x,y,0,nx,ny);
-      const auto in_adj=idx(x,y,1,nx,ny);
-      const Macros a=macros(&f_[in_adj*Q]);
-      for (int q=0;q<Q;++q)
-        f_[in*Q+q]=feq(q,a.rho,0,0,cfg_.u_in)+
-          f_[in_adj*Q+q]-feq(q,a.rho,a.ux,a.uy,a.uz);
-      const auto out=idx(x,y,nz-1,nx,ny);
-      const auto out_adj=idx(x,y,nz-2,nx,ny);
-      const Macros b=macros(&f_[out_adj*Q]);
-      for (int q=0;q<Q;++q)
-        f_[out*Q+q]=feq(q,1.0,b.ux,b.uy,b.uz)+
-          f_[out_adj*Q+q]-feq(q,b.rho,b.ux,b.uy,b.uz);
+    const int nz=cfg_.nz;
+    const int nx=cfg_.nx;
+    double imposed[Q], adjacent[Q], cell[Q];
+    for (int y=0;y<cfg_.ny;++y) {
+      const auto row=static_cast<std::size_t>(y)*nx*Q;
+      for (int x=0;x<nx;++x) {
+        load_cell(planes_[1].data()+row+x,nx,cell);
+        const Macros a=macros(cell);
+        equilibria({a.rho,0,0,cfg_.u_in},imposed);
+        equilibria(a,adjacent);
+        for (int q=0;q<Q;++q) cell[q]=imposed[q]+cell[q]-adjacent[q];
+        store_cell(planes_.front().data()+row+x,nx,cell);
+
+        load_cell(planes_[nz-2].data()+row+x,nx,cell);
+        const Macros b=macros(cell);
+        equilibria({1.0,b.ux,b.uy,b.uz},imposed);
+        equilibria(b,adjacent);
+        for (int q=0;q<Q;++q) cell[q]=imposed[q]+cell[q]-adjacent[q];
+        store_cell(planes_.back().data()+row+x,nx,cell);
+      }
+    }
+  }
+
+  template<class Visit>
+  void visit_fluid_macros(Visit visit) const {
+    std::size_t i=0;
+    double cell[Q];
+    for (const auto& plane : planes_) {
+      for (int y=0;y<cfg_.ny;++y) {
+        const double* row=plane.data()+static_cast<std::size_t>(y)*cfg_.nx*Q;
+        for (int x=0;x<cfg_.nx;++x,++i) {
+          if (solid_[i]) continue;
+          load_cell(row+x,cfg_.nx,cell);
+          visit(i,macros(cell));
+        }
+      }
     }
   }
 
   void report(int t) const {
     double minrho=std::numeric_limits<double>::infinity();
     double maxrho=0, maxu=0;
-    for (std::size_t i=0;i<n_;++i) {
-      if (solid_[i]) continue;
-      const auto m=macros(&f_[i*Q]);
+    visit_fluid_macros([&](std::size_t, const Macros& m) {
       minrho=std::min(minrho,m.rho);
       maxrho=std::max(maxrho,m.rho);
       maxu=std::max(maxu,std::sqrt(m.ux*m.ux+m.uy*m.uy+m.uz*m.uz));
-    }
+    });
     if (minrho<0.3 || maxrho>2.0 || maxu>0.35)
       throw std::runtime_error("Flow became unstable; reduce U/Re or refine grid");
     std::cout << "step " << std::setw(6) << t << " | rho ["
@@ -387,13 +536,12 @@ class Solver {
   void write_vtk(int t) const {
     std::vector<float> ux(n_,0),uy(n_,0),uz(n_,0),rho(n_,1),wmag(n_,0);
     const int nx=cfg_.nx,ny=cfg_.ny,nz=cfg_.nz;
-    for (std::size_t i=0;i<n_;++i) if (!solid_[i]) {
-      const auto m=macros(&f_[i*Q]);
+    visit_fluid_macros([&](std::size_t i, const Macros& m) {
       ux[i]=static_cast<float>(m.ux);
       uy[i]=static_cast<float>(m.uy);
       uz[i]=static_cast<float>(m.uz);
       rho[i]=static_cast<float>(m.rho);
-    }
+    });
     // Three-dimensional curl: x/y periodic, z one-sided at inlet/outlet.
     for(int z=0;z<nz;++z) for(int y=0;y<ny;++y) for(int x=0;x<nx;++x) {
       const auto i=idx(x,y,z,nx,ny);

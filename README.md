@@ -15,6 +15,20 @@ ctest --test-dir build --output-on-failure
 
 The solver requires only a C++17 toolchain and CMake. Serial execution only: no CUDA, MPI, OpenMP, GPU, or Kokkos. The optional reader regression test requires Python 3 with the VTK Python modules. CMake enables it when those modules are importable by the Python interpreter it finds; set `-DPython3_EXECUTABLE=/path/to/python` when configuring to select an interpreter. CMake reports when the reader test is disabled. Run `ctest --test-dir build -R vti_reader --output-on-failure` to run it separately.
 
+## Benchmark the serial optimizations
+
+```sh
+python3 benchmarks/compare.py
+```
+
+The script builds four single-threaded binaries with the same compiler and `-O0`. The original comes from Git revision `aaad885`. Applying `benchmarks/pre-simd.patch` to that revision reconstructs the earlier scalar optimizations. The working tree builds twice to measure the new storage layout with scalar collision (`-DLBM_DISABLE_SIMD`) and with runtime SIMD dispatch. The script requires Python 3, Git with the original revision available locally, and a GCC- or Clang-compatible compiler.
+
+Each row stores the X cells for a given D3Q19 direction consecutively. On AVX-capable x86 systems with GCC or Clang, collision loads four neighboring fluid cells into each vector. Both BGK and Smagorinsky collision use this path. Short runs of fluid cells use scalar collision, including any remainder at the end of a row. Other supported architectures and compilers use the scalar implementation. Streaming follows the contiguous X spans and sums reflected momentum in the original cell and direction order.
+
+The default workload is 48 × 48 × 112 for 24 steps. After one warm-up per binary, four timed rounds place each binary in each execution position once. The script prints each wall time, the medians, and speedup ratios. Timing includes initialization, stepping, diagnostics, and writing two snapshots. Compilation and byte comparisons of both snapshots and the force history happen outside the timed interval.
+
+Use `--grid NX NY NZ`, `--steps N`, `--smagorinsky CS`, `--repeats N`, and `--cxx COMPILER` to change the run. On Linux, prefix the command with `taskset -c CPU` to keep all four binaries on the same logical CPU. The [SIMD benchmark report](benchmarks/simd-report.txt) includes the commands and complete output from this machine.
+
 ## Model and flow axes
 
 The **longitudinal body axis is Z** and the inlet velocity points in **+Z**. `nx,ny` are the crossflow lattice extents, `nz` is streamwise. For the central body alone, at each lattice cell `(x,y,z)`:
