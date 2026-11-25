@@ -2,7 +2,7 @@
 
 This is a **working single-threaded C++17 3D CFD simulator**, not a 3D mesh generator. The solid body is computed **inside the fluid solver** as a voxelized bounce-back obstacle. There is no STL input or external surface-meshing step.
 
-The geometry is a **generic streamlined axisymmetric test body** with tangent-ogive nose, cylindrical section, and linear boattail ending in a flat rear cap. No Mk 82 or other weapon's actual dimensions or special components are modeled.
+The central body is a **generic streamlined axisymmetric test body** with tangent-ogive nose, cylindrical section, and linear boattail ending in a flat rear cap.
 
 ## Build
 
@@ -17,7 +17,7 @@ The solver requires only a C++17 toolchain and CMake. Serial execution only: no 
 
 ## Model and flow axes
 
-The **longitudinal body axis is Z** and the inlet velocity points in **+Z**. `nx,ny` are the crossflow lattice extents, `nz` is streamwise. For each lattice cell `(x,y,z)`:
+The **longitudinal body axis is Z** and the inlet velocity points in **+Z**. `nx,ny` are the crossflow lattice extents, `nz` is streamwise. For the central body alone, at each lattice cell `(x,y,z)`:
 
 ```cpp
 const double r = profile_.radius_at(double(z));
@@ -37,15 +37,17 @@ The continuous underlying surface is `x = xc + R(z)*cos(phi)`, `y = yc + R(z)*si
 - Rear radius: 0.60 of the maximum radius
 - Front tip begins at 16% of the computational Z length
 
+Four rectangular plates extend from the rear taper along the ±X and ±Y directions. Each span tilts 30° upstream from radial (60° to the nose direction, −Z), with the wide face exposed to the flow. Using the maximum body radius R, the nominal exposed length is 1.5 × 1.25R, the lateral width is 2.0R, and the thickness is 0.2R with a minimum of 1.5 lattice units for voxelization. The roots overlap the taper half a radius ahead of the rear face. The solver includes the plates in the same solid mask as the body.
+
 For better boundary resolution, increase all three lattice extents while preserving the relevant ratios.
 
 ## Parameters
 
 | Argument | Default | Description |
 |---|---:|---|
-| `--nx` | 48 | Lattice cells across X |
-| `--ny` | 48 | Lattice cells across Y |
-| `--nz` | 112 | Lattice cells along Z (flow direction) |
+| `--nx` | 288 | Lattice cells across X |
+| `--ny` | 288 | Lattice cells across Y |
+| `--nz` | 672 | Lattice cells along Z (flow direction) |
 | `--steps` | 500 | Number of time steps |
 | `--every` | 250 | Snapshot interval |
 | `--u` | 0.045 | Uniform +Z inlet velocity in lattice units |
@@ -58,6 +60,10 @@ The model uses D3Q19 BGK collision and pull streaming, no-slip halfway bounce-ba
 ## Visualize the simulation in ParaView
 
 The solver writes `flow_000000.vti` at initialization and subsequent numbered `.vti` snapshots at the requested interval and final step. Open the `.vti` file series in ParaView and click **Apply**; the animation controls select snapshots. The six-digit numbers are simulation step indices, not physical times. Use a fresh output directory for each run to avoid mixing old snapshots with new ones.
+
+With 500 steps and an interval of 250, the three snapshots show initialization, step 250 and step 500. The solid geometry is fixed throughout. The terminal prints the instantaneous `Cd` at each snapshot interval and its mean over the last quarter of the run at completion. The accompanying `forces.csv` records step, force components and drag coefficient every `--force-every` steps and at the last step. Legacy `.vtk` snapshots in older output directories belong to earlier runs.
+
+The default grid is 288 × 288 × 672. Each snapshot occupies about 1.3 GiB. The solver advances one Z plane at a time and keeps two extra planes for streaming, with about 9 GiB of array storage at snapshot time. At the same lattice inlet speed, doubling each grid dimension requires twice as many steps to cover the same distance in body lengths.
 
 The XML ImageData volume has unit spacing and origin `(0,0,0)` in lattice units, with dimensions `nx × ny × nz`. All arrays are **point data**, sampled at integer lattice coordinates, with X varying fastest. `velocity` is a three-component vector; `speed`, `density`, `vorticity_magnitude`, and `solid` are scalars. `solid` is 1 inside the body and 0 in the fluid. Flow is in +Z, so the wake is downstream toward larger Z.
 
@@ -72,4 +78,4 @@ Solid points have zero velocity, speed, and vorticity, and density is set to 1 a
 
 `ctest` runs a small solver smoke test. When VTK Python modules are available it also runs `lbm_3d_vti_reader`, which generates fresh initial and final snapshots and uses VTK's XML reader to check dimensions, coordinates, arrays, values, and a nonempty obstacle contour. The original legacy files were readable by VTK in the checked sample; no specific corruption was established. XML ImageData makes the array types, association, byte order, and binary block lengths explicit.
 
-**Limitations:** This is an educational low-Reynolds-number solver. It is not validated for actual turbulent airflow, drag prediction, weapons aerodynamics, or flight performance. The voxelized surface has staircasing, the boundary conditions are approximate, and periodic crossflow boundaries may interact with the wake. No fins, moving parts, deployment geometry, or weapon-specific features are implemented.
+**Limitations:** This is an educational low-Reynolds-number solver. It is not validated for actual turbulent airflow, drag prediction, or flight performance. The voxelized surface has staircasing, the boundary conditions are approximate, and periodic crossflow boundaries may interact with the wake. The four rear plates are fixed throughout the simulation.

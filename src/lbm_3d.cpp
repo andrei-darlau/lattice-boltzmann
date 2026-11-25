@@ -1,6 +1,5 @@
 // Single-threaded D3Q19 lattice Boltzmann implementation.
 // Flow past a generic stationary ogive-nose / cylindrical / boattail body.
-// This geometry is not a reproduction of a projectile or other weapon.
 // All quantities are in non-dimensional lattice units.
 
 #include <algorithm>
@@ -34,11 +33,14 @@ constexpr std::array<double, Q> weight = {
     1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0,1.0/36.0};
 
 struct Config {
-  int nx = 48, ny = 48, nz = 112;
+  int nx = 288, ny = 288, nz = 672;
   int steps = 500, every = 250;
+  int force_every = 10;
   double u_in = 0.045;
   double reynolds = 35.0; // nominal Re using full maximum body diameter
   double smagorinsky = 0.0; // experimental eddy-viscosity option, off by default
+  bool canopy = false;
+  double canopy_gap = 4.0, canopy_radius = 1.6;
   std::string out = "output_3d";
 };
 struct Macros { double rho, ux, uy, uz; };
@@ -46,7 +48,10 @@ struct Macros { double rho, ux, uy, uz; };
 void usage(const char* name) {
   std::cout << "Usage: " << name << " [--nx N] [--ny N] [--nz N]"
                " [--steps N] [--every N] [--u U] [--re RE]"
-               " [--smagorinsky CS] [--out DIRECTORY]\n"
+               " [--smagorinsky CS] [--canopy 0|1] [--canopy-gap G]"
+               " [--canopy-radius R] [--force-every N] [--out DIRECTORY]\n"
+               "Canopy defaults to 0; gap and radius are in body radii (defaults 4.0 and 1.6); "
+               "force output defaults to every 10 steps.\n"
                "Serial D3Q19 LBM around a GENERIC ogive/cylinder/boattail solid, +Z flow.\n";
 }
 Config parse_args(int argc, char** argv) {
@@ -61,6 +66,13 @@ Config parse_args(int argc, char** argv) {
     else if (a=="--nz") c.nz=std::stoi(v);
     else if (a=="--steps") c.steps=std::stoi(v);
     else if (a=="--every") c.every=std::stoi(v);
+    else if (a=="--force-every") c.force_every=std::stoi(v);
+    else if (a=="--canopy") {
+      if (v!="0" && v!="1") throw std::invalid_argument("Require --canopy 0 or 1");
+      c.canopy=(v=="1");
+    }
+    else if (a=="--canopy-gap") c.canopy_gap=std::stod(v);
+    else if (a=="--canopy-radius") c.canopy_radius=std::stod(v);
     else if (a=="--u") c.u_in=std::stod(v);
     else if (a=="--re") c.reynolds=std::stod(v);
     else if (a=="--smagorinsky") c.smagorinsky=std::stod(v);
@@ -69,6 +81,9 @@ Config parse_args(int argc, char** argv) {
   }
   if (c.nx<28 || c.ny<28 || c.nz<64 || c.steps<1 || c.every<1)
     throw std::invalid_argument("Grid must be at least 28x28x64; steps/every >= 1");
+  if (c.force_every<1 || !std::isfinite(c.canopy_gap) || c.canopy_gap<0 ||
+      !std::isfinite(c.canopy_radius) || c.canopy_radius<=0)
+    throw std::invalid_argument("Require force-every >= 1, finite canopy-gap >= 0 and canopy-radius > 0");
   if (!(c.u_in>0 && c.u_in<0.12) || !(c.reynolds>0) ||
       !(c.smagorinsky>=0.0 && c.smagorinsky<=0.2))
     throw std::invalid_argument("Require 0<u<0.12, Re>0, 0<=Cs<=0.2");
@@ -116,11 +131,40 @@ struct RevolvedProfile {
   }
 };
 
+// Four identical rectangular plates. Folding the cross-section into one
+// quadrant makes the pairs along X and Y exact quarter-turn copies.
+struct RearPlates {
+  double root_r, root_z, span, half_width, half_thickness;
+  double axial, radial;  // components of the unit vector along the span
+
+  bool inside(double dx, double dy, double z) const {
+    const double x=std::abs(dx), y=std::abs(dy);
+    const double dz=z-root_z;
+    auto within_span = [&](double distance) {
+      const double dr=distance-root_r;
+      const double along=dr*radial+dz*axial;
+      const double normal=dz*radial-dr*axial;
+      return along>=0 && along<=span && std::abs(normal)<=half_thickness;
+    };
+    return (y<=half_width && within_span(x)) || (x<=half_width && within_span(y));
+  }
+};
+
+struct Canopy {
+  double xc, yc, zc, R, thick;
+  bool inside(double x,double y,double z) const {
+    const double dx=x-xc, dy=y-yc, dz=z-zc;
+    const double dist=std::sqrt(dx*dx+dy*dy+dz*dz);
+    return dz>=0 && dist>=R-thick && dist<=R;
+  }
+};
+
 class Solver {
  public:
   explicit Solver(Config c) : cfg_(std::move(c)),
       n_(static_cast<std::size_t>(cfg_.nx)*cfg_.ny*cfg_.nz),
-      solid_(n_,0), f_(n_*Q,0), post_(n_*Q,0), next_(n_*Q,0) {
+      solid_(n_,0), f_(n_*Q,0), plane_size_(static_cast<std::size_t>(cfg_.nx)*cfg_.ny),
+      pending_(plane_size_*Q), current_(plane_size_*Q) {
     radius_=std::min(cfg_.nx,cfg_.ny)/8.5;
     const double diameter=2.0*radius_;
     viscosity_=cfg_.u_in*diameter/cfg_.reynolds;
@@ -128,7 +172,7 @@ class Solver {
     if (tau_<0.515)
       throw std::invalid_argument("tau too near 0.5 for this educational BGK solver; lower Re");
 
-    // Entire body is defined by a continuous radial profile around the Z axis:
+    // The central body is defined by a continuous radial profile around the Z axis:
     //   x = cx + R(z)*cos(phi), y = cy + R(z)*sin(phi).
     // Only the inside/outside test is needed for the Cartesian D3Q19 lattice.
     // These arbitrary dimensionless ratios describe a generic test body.
@@ -144,13 +188,31 @@ class Solver {
     if (profile_.tail_end>0.77*cfg_.nz)
       throw std::invalid_argument("Shape too long for streamwise grid; increase --nz");
     const double xc=(cfg_.nx-1.0)/2.0, yc=(cfg_.ny-1.0)/2.0;
+    canopy_={xc,yc,profile_.tail_end+cfg_.canopy_gap*radius_,
+             cfg_.canopy_radius*radius_,2.0};
+    if (cfg_.canopy && canopy_.zc+canopy_.R>0.85*cfg_.nz)
+      throw std::invalid_argument("Canopy too long for streamwise grid; increase --nz");
+    // Pivot about the original span centerline's exit from the rear taper.
+    const double root_z=profile_.tail_end-0.5*radius_;
+    const double overlap=0.25*radius_;
+    const double degrees=std::acos(-1.0)/180.0;
+    const double taper_slope=(profile_.end_radius-radius_)/(profile_.tail_end-profile_.barrel_end);
+    const double previous_slope=std::tan(10.0*degrees);
+    const double mount_z=root_z+overlap*previous_slope/(1.0-taper_slope*previous_slope);
+    const double tilt=-30.0*degrees;  // toward the nose from the radial direction
+    const double axial=std::sin(tilt), radial=std::cos(tilt);
+    const RearPlates plates{profile_.radius_at(mount_z)-overlap*radial,
+                            mount_z-overlap*axial, 1.875*radius_+overlap,
+                            radius_, std::max(0.75,0.10*radius_), axial, radial};
     std::size_t solid_count=0;
     for(int z=0;z<cfg_.nz;++z) {
       const double r=profile_.radius_at(static_cast<double>(z));
       for(int y=0;y<cfg_.ny;++y) for(int x=0;x<cfg_.nx;++x) {
         const auto i=idx(x,y,z,cfg_.nx,cfg_.ny);
         const double dx=x-xc, dy=y-yc;
-        solid_[i]=(r>0.0 && dx*dx+dy*dy<=r*r) ? 1 : 0;
+        solid_[i]=(r>0.0 && dx*dx+dy*dy<=r*r) ||
+                  plates.inside(dx,dy,z) ||
+                  (cfg_.canopy && canopy_.inside(x,y,z));
         solid_count+=solid_[i];
         for (int q=0;q<Q;++q)
           f_[i*Q+q]=feq(q,1.0,0.0,0.0,cfg_.u_in);
@@ -161,6 +223,10 @@ class Solver {
 
   void run() {
     std::filesystem::create_directories(cfg_.out);
+    const auto force_path=std::filesystem::path(cfg_.out)/"forces.csv";
+    std::ofstream forces(force_path);
+    if (!forces) throw std::runtime_error("Cannot write " + force_path.string());
+    forces << "step,Fx,Fy,Fz,Cd\n" << std::setprecision(17);
     std::cout << "Serial D3Q19 BGK, grid " << cfg_.nx << 'x' << cfg_.ny << 'x' << cfg_.nz
               << ", generic ogive body radius=" << radius_
               << ", U=" << cfg_.u_in << ", Re=" << cfg_.reynolds
@@ -168,28 +234,43 @@ class Solver {
               << ", Cs=" << cfg_.smagorinsky << "\n";
     write_vtk(0);
     for (int t=1;t<=cfg_.steps;++t) {
-      collide();
       stream();
       set_open_boundaries();
-      f_.swap(next_);
+      if (t>cfg_.steps*3LL/4) { cd_sum_+=cd(); ++cd_count_; }
+      if (t%cfg_.force_every==0 || t==cfg_.steps)
+        forces << t << ',' << fx_ << ',' << fy_ << ',' << fz_ << ',' << cd() << '\n';
       if (t%cfg_.every==0 || t==cfg_.steps) {
         report(t);
         write_vtk(t);
       }
     }
+    if (!forces) throw std::runtime_error("Error writing " + force_path.string());
+    std::cout << "Mean Cd over last 25% of steps: " << std::setprecision(10)
+              << cd_sum_/cd_count_ << '\n';
   }
  private:
   Config cfg_;
   std::size_t n_;
   std::vector<std::uint8_t> solid_;
-  std::vector<double> f_, post_, next_;
+  std::vector<double> f_;
+  const std::size_t plane_size_;
+  std::vector<double> pending_, current_;
   double radius_=0, viscosity_=0, tau_=0;
   RevolvedProfile profile_{};
+  Canopy canopy_{};
+  double fx_=0, fy_=0, fz_=0, cd_sum_=0;
+  int cd_count_=0;
 
-  void collide() {
-    for (std::size_t i=0;i<n_;++i) {
+  double cd() const {
+    const double pi=std::acos(-1.0);
+    return fz_/(0.5*cfg_.u_in*cfg_.u_in*pi*radius_*radius_);
+  }
+
+  void collide_plane(int z) {
+    const auto end=(z+1)*plane_size_;
+    for (std::size_t i=z*plane_size_;i<end;++i) {
       if (solid_[i]) continue;
-      const double* fi=&f_[i*Q];
+      double* fi=&f_[i*Q];
       const Macros m=macros(fi);
       double local_tau=tau_;
       if (cfg_.smagorinsky>0) {
@@ -209,31 +290,47 @@ class Solver {
                       36.0/std::sqrt(2.0)*cs2*norm/m.rho));
       }
       const double omega=1.0/local_tau;
-      double* dst=&post_[i*Q];
       for (int q=0;q<Q;++q) {
         const double eq=feq(q,m.rho,m.ux,m.uy,m.uz);
-        dst[q]=fi[q]-omega*(fi[q]-eq);
+        fi[q]=fi[q]-omega*(fi[q]-eq);
       }
     }
   }
   void stream() {
     const int nx=cfg_.nx,ny=cfg_.ny,nz=cfg_.nz;
+    fx_=fy_=fz_=0;
     // Interior +Z flow planes; the Z inlet/outlet are set below.
     // X/Y transverse boundaries are periodic.
-    for (int z=1;z<nz-1;++z) for(int y=0;y<ny;++y)
-      for (int x=0;x<nx;++x) {
+    // D3Q19 reaches just one plane away. Keep z-1 pending until z has
+    // read it, then reuse its storage for the streamed populations.
+    collide_plane(0);
+    collide_plane(1);
+    for (int z=1;z<nz-1;++z) {
+      collide_plane(z+1);
+      for(int y=0;y<ny;++y) for (int x=0;x<nx;++x) {
         const auto dest=idx(x,y,z,nx,ny);
         if (solid_[dest]) continue;
-        double* dst=&next_[dest*Q];
+        double* dst=&current_[(static_cast<std::size_t>(y)*nx+x)*Q];
         for (int q=0;q<Q;++q) {
           const int sx=(x-cx[q]+nx)%nx;
           const int sy=(y-cy[q]+ny)%ny;
           const int sz=z-cz[q];
           const auto src=idx(sx,sy,sz,nx,ny);
-          dst[q]=solid_[src] ? post_[dest*Q+opposite[q]]
-                              : post_[src*Q+q];
+          if (solid_[src]) {
+            const int oq=opposite[q];
+            const double reflected=f_[dest*Q+oq];
+            dst[q]=reflected;
+            // The incident population travels toward the solid in direction oq.
+            fx_+=2*reflected*cx[oq];
+            fy_+=2*reflected*cy[oq];
+            fz_+=2*reflected*cz[oq];
+          } else dst[q]=f_[src*Q+q];
         }
       }
+      if (z>1) std::copy(pending_.begin(),pending_.end(),f_.begin()+(z-1)*plane_size_*Q);
+      pending_.swap(current_);
+    }
+    std::copy(pending_.begin(),pending_.end(),f_.begin()+(nz-2)*plane_size_*Q);
   }
   void set_open_boundaries() {
     // First-order non-equilibrium extrapolation at Z inlet/outlet.
@@ -242,16 +339,16 @@ class Solver {
     for(int y=0;y<ny;++y) for(int x=0;x<nx;++x) {
       const auto in=idx(x,y,0,nx,ny);
       const auto in_adj=idx(x,y,1,nx,ny);
-      const Macros a=macros(&next_[in_adj*Q]);
+      const Macros a=macros(&f_[in_adj*Q]);
       for (int q=0;q<Q;++q)
-        next_[in*Q+q]=feq(q,a.rho,0,0,cfg_.u_in)+
-          next_[in_adj*Q+q]-feq(q,a.rho,a.ux,a.uy,a.uz);
+        f_[in*Q+q]=feq(q,a.rho,0,0,cfg_.u_in)+
+          f_[in_adj*Q+q]-feq(q,a.rho,a.ux,a.uy,a.uz);
       const auto out=idx(x,y,nz-1,nx,ny);
       const auto out_adj=idx(x,y,nz-2,nx,ny);
-      const Macros b=macros(&next_[out_adj*Q]);
+      const Macros b=macros(&f_[out_adj*Q]);
       for (int q=0;q<Q;++q)
-        next_[out*Q+q]=feq(q,1.0,b.ux,b.uy,b.uz)+
-          next_[out_adj*Q+q]-feq(q,b.rho,b.ux,b.uy,b.uz);
+        f_[out*Q+q]=feq(q,1.0,b.ux,b.uy,b.uz)+
+          f_[out_adj*Q+q]-feq(q,b.rho,b.ux,b.uy,b.uz);
     }
   }
 
@@ -269,7 +366,9 @@ class Solver {
       throw std::runtime_error("Flow became unstable; reduce U/Re or refine grid");
     std::cout << "step " << std::setw(6) << t << " | rho ["
               << std::fixed << std::setprecision(5)
-              << minrho << ", " << maxrho << "] | max |u|=" << maxu << '\n';
+              << minrho << ", " << maxrho << "] | max |u|=" << maxu
+              << " | Fx=" << fx_ << " Fy=" << fy_ << " Fz=" << fz_
+              << " Cd=" << cd() << '\n';
   }
 
   // VTK XML appended data uses explicitly little-endian byte counts and values.
